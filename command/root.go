@@ -6,7 +6,6 @@ import (
 	"github.com/spf13/cobra"
 	"os/exec"
 	"time"
-	"fmt"
 	"os"
 )
 
@@ -86,18 +85,24 @@ var RootCommand = &cobra.Command{
 }
 
 func runCommand(childChannel chan *exec.Cmd, args []string) {
-	child := exec.Command(args[0], args[1:]...)		
+	child := exec.Command(args[0], args[1:]...)
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	
 	stdin, err := child.StdinPipe()
 	if err != nil {
 		log.Fatal(err)
 	}
-	stdin.Close()
+	err = stdin.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
 	
 	childChannel <- child
 
 	log.Debugf("Running %v", args)
-	out, err := child.CombinedOutput()
-	fmt.Print(string(out))
+	err = child.Run()
+	
 	if err != nil {
 		log.Warnf("%v: waiting for file change to restart command", err)
 	} else {

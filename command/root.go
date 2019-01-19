@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"time"
 	"os"
+	"reflect"
+	"syscall"
 )
 
 func init() {
@@ -70,12 +72,15 @@ var RootCommand = &cobra.Command{
 		
 		childChannel := make(chan *exec.Cmd)
 		for true {
+			log.Infof("Starting child process")
 			go runCommand(childChannel, args)
 			child := <-childChannel
 			<-update
-			log.Warnf("Killing child process")
-			child.Process.Kill()
-			log.Warnf("restarting")
+			log.Infof("Killing child process")
+			err := syscall.Kill(child.Process.Pid, syscall.Signal(syscall.SIGTERM))
+			if err != nil {
+				log.Warnf("Error killing process [%v]: %v", reflect.TypeOf(err), err)
+			}
 		}
 		
 		// Wait for watchPath go routines to finish. They're in infinite loops, so

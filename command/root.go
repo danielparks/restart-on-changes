@@ -82,41 +82,78 @@ var RootCommand = &cobra.Command{
 			go watchPath(updateChannel, path)
 		}
 		
-		childChannel := make(chan *exec.Cmd)
-		exitChannel := make(chan bool)
-		for true {
-			log.Debugf("Starting child process")
-			go runCommand(childChannel, exitChannel, args)
-			child := <-childChannel
-			
-			// Wait for an update to the file system
-			<-updateChannel
-			log.Infof("Sending SIGTERM to child process %d", child.Process.Pid)
-			err := syscall.Kill(child.Process.Pid, syscall.Signal(syscall.SIGTERM))
-			if err != nil {
-				log.Warnf("Error killing process [%v]: %v", reflect.TypeOf(err), err)
-			}
-			
-			select {
-			case <-exitChannel:
-				log.Debugf("Child process exited; restarting")
-			case <-time.After(500 * time.Millisecond):
-				log.Infof("Sending SIGKILL to child process %d", child.Process.Pid)
-				err := syscall.Kill(child.Process.Pid, syscall.Signal(syscall.SIGKILL))
-				if err != nil {
-					log.Warnf("Error killing process [%v]: %v", reflect.TypeOf(err), err)
-				}
-				/// FIXME we should check that it's actually dead.
-			}
+		for {
+			runUntil(args, updateChannel)
+			log.Warnf("Restarting child process")
 		}
 	},
 }
 
-func runCommand(childChannel chan *exec.Cmd, exitChannel chan bool, args []string) {
+func runUntil(command []string, updateChannel chan bool) {
+	pgidChannel := make(chan int)
+	exitChannel := make(chan ChildExit)
+	
+	log.Debugf("Starting child process")
+	go runCommand(pgidChannel, exitChannel, command)
+	pgid := <-pgidChannel
+	
+	select {
+	case result := <-exitChannel:
+		// We got an exit before a file system update.
+		if result.Err == nil {
+			log.Infof("Child process %d exited: success", result.Pid)
+			os.Exit(0)
+		}
+		
+		log.Warnf("Child process %d exited: %v", result.Pid, result.Err)
+		log.Warnf("Waiting for file change to restart command")
+		
+		// Wait for an update to restart.
+		<-updateChannel
+		return
+	case <-updateChannel:
+		// Got an update without an exit. Continue.
+	}
+	
+	log.Infof("File system changed; restarting")
+	
+	// The child needs to be restarted
+	log.Debugf("Sending SIGTERM to child process group %d", pgid)
+	err := syscall.Kill(-pgid, syscall.Signal(syscall.SIGTERM))
+	if err != nil {
+		log.Warnf("Error killing process [%v]: %v", reflect.TypeOf(err), err)
+	}
+
+	select {
+	case result := <-exitChannel:
+		if result.Err == nil {
+			log.Infof("Child process %d exited: success", result.Pid)
+			os.Exit(0)
+		}
+	case <-time.After(500 * time.Millisecond):
+		log.Debugf("Sending SIGKILL to child process group %d", pgid)
+		err = syscall.Kill(-pgid, syscall.Signal(syscall.SIGKILL))
+		if err != nil {
+			log.Warnf("Error killing process [%v]: %v", reflect.TypeOf(err), err)
+		}
+		/// FIXME we should check that it's actually dead.
+	}
+}
+
+type ChildExit struct {
+	Pid int
+	Err error
+}
+
+func runCommand(pgidChannel chan int, exitChannel chan ChildExit, args []string) {
 	child := exec.Command(args[0], args[1:]...)
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
+
+	// Create child in its own process group so we can kill it and its
+	// descendants all at once.
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	log.Debugf("Starting %v", args)
 	err := child.Start()
@@ -125,19 +162,39 @@ func runCommand(childChannel chan *exec.Cmd, exitChannel chan bool, args []strin
 	}
 	
 	pid := child.Process.Pid
-	log.Infof("Child process %d started %v", pid, args)
-	childChannel <- child
+	pgid := getPgid(pid)
 	
-	err = child.Wait()
-	if err != nil {
-		log.Warnf("Child process %d exited: %v", pid, err)
-		log.Warnf("Waiting for file change to restart command")
-	} else {
-		log.Warnf("Child process %d exited: success", pid)
-		os.Exit(0)
+	// If the process wasn't found, pgid will be 0. child.Wait() will return the
+	// exit code, so we'll just skip straight to that.
+	if pgid > 0 {
+		log.Debugf("Child process %d (PGID %d) started %v", pid, pgid, args)
+		pgidChannel <- pgid
 	}
 	
-	exitChannel <- true
+	err = child.Wait()
+	exitChannel <- ChildExit{pid, err}
+}
+
+// Returns 0 if the process is not found
+func getPgid(pid int) int {
+	pgid, err := syscall.Getpgid(pid)
+	if err != nil {
+		switch err.(type) {
+		case syscall.Errno:
+			if err == syscall.ESRCH {
+				// Not found
+				return 0
+			} else {
+				log.Fatalf("Could not get process group for child %d: %v (errno %d)",
+					pid, err, err)
+			}
+		default:
+			log.Fatalf("Could not get process group for child %d: %v [%v]",
+				pid, err, reflect.TypeOf(err))
+		}
+	}
+	
+	return pgid
 }
 
 func watchPath(updateChannel chan bool, path string) {

@@ -9,7 +9,19 @@ import (
 	"os"
 	"reflect"
 	"syscall"
+	"fmt"
 )
+type LogFormatter struct {}
+var RealFormatter = &log.TextFormatter{}
+
+func (formatter *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
+	b, err := RealFormatter.Format(entry)
+	if err == nil {
+		return append([]byte(fmt.Sprintf("PID=%d ", os.Getpid())), b...), nil
+	} else {
+		return b, err
+	}
+}
 
 func init() {
 	RootCommand.PersistentFlags().BoolP("verbose", "v", false,
@@ -21,6 +33,7 @@ func init() {
 	RootCommand.PersistentFlags().StringP("path", "p", ".",
 		"Path to watch")
 
+	log.SetFormatter(&LogFormatter{})
 }
 
 func getFlagBool(command *cobra.Command, name string) bool {

@@ -77,59 +77,70 @@ var RootCommand = &cobra.Command{
 	Run: func(command *cobra.Command, args []string) {
 		paths := []string{getFlagString(command, "path")}
 		
-		done := make(chan bool)
-		update := make(chan bool)
+		updateChannel := make(chan bool)
 		for _, path := range paths {
-			go watchPath(update, path)
+			go watchPath(updateChannel, path)
 		}
 		
 		childChannel := make(chan *exec.Cmd)
+		exitChannel := make(chan bool)
 		for true {
-			log.Infof("Starting child process")
-			go runCommand(childChannel, args)
+			log.Debugf("Starting child process")
+			go runCommand(childChannel, exitChannel, args)
 			child := <-childChannel
-			<-update
-			log.Infof("Killing child process")
+			
+			// Wait for an update to the file system
+			<-updateChannel
+			log.Infof("Sending SIGTERM to child process %d", child.Process.Pid)
 			err := syscall.Kill(child.Process.Pid, syscall.Signal(syscall.SIGTERM))
 			if err != nil {
 				log.Warnf("Error killing process [%v]: %v", reflect.TypeOf(err), err)
 			}
+			
+			select {
+			case <-exitChannel:
+				log.Debugf("Child process exited; restarting")
+			case <-time.After(500 * time.Millisecond):
+				log.Infof("Sending SIGKILL to child process %d", child.Process.Pid)
+				err := syscall.Kill(child.Process.Pid, syscall.Signal(syscall.SIGKILL))
+				if err != nil {
+					log.Warnf("Error killing process [%v]: %v", reflect.TypeOf(err), err)
+				}
+				/// FIXME we should check that it's actually dead.
+			}
 		}
-		
-		// Wait for watchPath go routines to finish. They're in infinite loops, so
-		// this will never return.
-		<-done
 	},
 }
 
-func runCommand(childChannel chan *exec.Cmd, args []string) {
+func runCommand(childChannel chan *exec.Cmd, exitChannel chan bool, args []string) {
 	child := exec.Command(args[0], args[1:]...)
+	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	
-	stdin, err := child.StdinPipe()
-	if err != nil {
-		log.Fatal(err)
-	}
-	err = stdin.Close()
-	if err != nil {
-		log.Fatal(err)
-	}
-	
-	childChannel <- child
 
-	log.Debugf("Running %v", args)
-	err = child.Run()
-	
+	log.Debugf("Starting %v", args)
+	err := child.Start()
 	if err != nil {
-		log.Warnf("%v: waiting for file change to restart command", err)
+		log.Fatalf("Could not start %v: %v", args, err)
+	}
+	
+	pid := child.Process.Pid
+	log.Infof("Child process %d started %v", pid, args)
+	childChannel <- child
+	
+	err = child.Wait()
+	if err != nil {
+		log.Warnf("Child process %d exited: %v", pid, err)
+		log.Warnf("Waiting for file change to restart command")
 	} else {
-		log.Debugf("Command finished successfully")
+		log.Warnf("Child process %d exited: success", pid)
 		os.Exit(0)
 	}
+	
+	exitChannel <- true
 }
 
-func watchPath(update chan bool, path string) {
+func watchPath(updateChannel chan bool, path string) {
 	log.Debugf("Watching path %q", path)
 	
 	/// FIXME: aggregate paths per device?
@@ -150,7 +161,7 @@ func watchPath(update chan bool, path string) {
 		for _, event := range msg {
 			logEvent(event)
 		}
-		update <- true
+		updateChannel <- true
 	}
 	log.Fatalf("Ran out of events for path %q", path)
 }

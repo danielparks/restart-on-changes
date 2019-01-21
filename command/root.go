@@ -1,18 +1,20 @@
 package command
 
 import (
+	"fmt"
 	"github.com/fsnotify/fsevents"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"os/exec"
-	"time"
 	"os"
+	"os/exec"
 	"os/signal"
 	"reflect"
 	"syscall"
-	"fmt"
+	"time"
 )
-type LogFormatter struct {}
+
+type LogFormatter struct{}
+
 var RealFormatter = &log.TextFormatter{}
 
 func (formatter *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
@@ -77,12 +79,12 @@ var RootCommand = &cobra.Command{
 	},
 	Run: func(command *cobra.Command, args []string) {
 		paths := []string{getFlagString(command, "path")}
-		
+
 		updateChannel := make(chan bool)
 		for _, path := range paths {
 			go watchPath(updateChannel, path)
 		}
-		
+
 		for {
 			runUntil(args, updateChannel)
 			log.Warnf("Restarting child process")
@@ -93,18 +95,18 @@ var RootCommand = &cobra.Command{
 func runUntil(command []string, updateChannel chan bool) {
 	pgidChannel := make(chan int)
 	exitChannel := make(chan ChildExit)
-	
+
 	// Signals do not block, so there must be a buffer:
 	signalChannel := make(chan os.Signal, 5)
 	signal.Notify(signalChannel)
-	
+
 	log.Debugf("Starting child process")
 	go runCommand(pgidChannel, exitChannel, command)
 	pgid := <-pgidChannel
-	
+
 	var s os.Signal
 	var result ChildExit
-	
+
 	for {
 		select {
 		case s = <-signalChannel:
@@ -113,14 +115,14 @@ func runUntil(command []string, updateChannel chan bool) {
 				_ = killAll(pgid, exitChannel)
 				os.Exit(128 + int(s.(syscall.Signal))) // Exit code includes signal
 			}
-			
+
 			// Pass the signal along. FIXME: only to immediate child?
 			log.Debugf("Received signal %v: passing it to all processes", s)
 			err := syscall.Kill(-pgid, s.(syscall.Signal))
 			if err != nil {
 				log.Warnf("Could not pass received signal %v to children", s)
 			}
-			
+
 			// Loop
 		case result = <-exitChannel:
 			// We got an exit before a file system update.
@@ -128,25 +130,25 @@ func runUntil(command []string, updateChannel chan bool) {
 				log.Infof("Child process %d exited: success", result.Pid)
 				os.Exit(0)
 			}
-			
+
 			signal.Reset()
 			log.Warnf("Child process %d exited: %v", result.Pid, result.Err)
-			
+
 			log.Warnf("Waiting for file change to restart command")
 			<-updateChannel
-			
+
 			return
 		case <-updateChannel:
 			// Got an update without an exit.
 			log.Infof("File system changed; restarting")
-	
+
 			// The child needs to be restarted
 			err := killAll(pgid, exitChannel)
 			if err == nil {
 				log.Infof("Child process %d exited: success", result.Pid)
 				os.Exit(0)
 			}
-			
+
 			return
 		}
 	}
@@ -166,21 +168,21 @@ func killAll(pgid int, exitChannel chan ChildExit) error {
 	case <-time.After(500 * time.Millisecond):
 		// Continue
 	}
-	
+
 	log.Debugf("Sending SIGKILL to child process group %d", pgid)
 	err = syscall.Kill(-pgid, syscall.Signal(syscall.SIGKILL))
 	if err != nil {
 		log.Warnf("Error killing process group: %v [%v]",
 			err, reflect.TypeOf(err))
 	}
-	
+
 	select {
 	case result := <-exitChannel:
 		return result.Err
 	case <-time.After(500 * time.Millisecond):
 		log.Fatalf("Could not kill process group %d", pgid)
 	}
-	
+
 	panic("Invalid point in code")
 }
 
@@ -208,17 +210,17 @@ func runCommand(pgidChannel chan int, exitChannel chan ChildExit, args []string)
 	if err != nil {
 		log.Fatalf("Could not start %v: %v", args, err)
 	}
-	
+
 	pid := child.Process.Pid
 	pgid := getPgid(pid)
-	
+
 	// If the process wasn't found, pgid will be 0. child.Wait() will return the
 	// exit code, so we'll just skip straight to that.
 	if pgid > 0 {
 		log.Debugf("Child process %d (PGID %d) started %v", pid, pgid, args)
 		pgidChannel <- pgid
 	}
-	
+
 	err = child.Wait()
 	exitChannel <- ChildExit{pid, err}
 }
@@ -241,13 +243,13 @@ func getPgid(pid int) int {
 				pid, err, reflect.TypeOf(err))
 		}
 	}
-	
+
 	return pgid
 }
 
 func watchPath(updateChannel chan bool, path string) {
 	log.Debugf("Watching path %q", path)
-	
+
 	/// FIXME: aggregate paths per device?
 	device, err := fsevents.DeviceForPath(path)
 	if err != nil {

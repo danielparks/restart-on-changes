@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"time"
 	"os"
+	"os/signal"
 	"reflect"
 	"syscall"
 	"fmt"
@@ -93,30 +94,65 @@ func runUntil(command []string, updateChannel chan bool) {
 	pgidChannel := make(chan int)
 	exitChannel := make(chan ChildExit)
 	
+	// Signals do not block, so there must be a buffer:
+	signalChannel := make(chan os.Signal, 5)
+	signal.Notify(signalChannel)
+	
 	log.Debugf("Starting child process")
 	go runCommand(pgidChannel, exitChannel, command)
 	pgid := <-pgidChannel
 	
-	select {
-	case result := <-exitChannel:
-		// We got an exit before a file system update.
-		if result.Err == nil {
-			log.Infof("Child process %d exited: success", result.Pid)
-			os.Exit(0)
+	var s os.Signal
+	var result ChildExit
+	
+	for {
+		select {
+		case s = <-signalChannel:
+			if isKillSignal(s) {
+				log.Debugf("Received signal %v: killing all processes", s)
+				_ = killAll(pgid, exitChannel)
+				os.Exit(128 + int(s.(syscall.Signal))) // Exit code includes signal
+			}
+			
+			// Pass the signal along. FIXME: only to immediate child?
+			log.Debugf("Received signal %v: passing it to all processes", s)
+			err := syscall.Kill(-pgid, s.(syscall.Signal))
+			if err != nil {
+				log.Warnf("Could not pass received signal %v to children", s)
+			}
+			
+			// Loop
+		case result = <-exitChannel:
+			// We got an exit before a file system update.
+			if result.Err == nil {
+				log.Infof("Child process %d exited: success", result.Pid)
+				os.Exit(0)
+			}
+			
+			signal.Reset()
+			log.Warnf("Child process %d exited: %v", result.Pid, result.Err)
+			
+			log.Warnf("Waiting for file change to restart command")
+			<-updateChannel
+			
+			return
+		case <-updateChannel:
+			// Got an update without an exit.
+			log.Infof("File system changed; restarting")
+	
+			// The child needs to be restarted
+			err := killAll(pgid, exitChannel)
+			if err == nil {
+				log.Infof("Child process %d exited: success", result.Pid)
+				os.Exit(0)
+			}
+			
+			return
 		}
-		
-		log.Warnf("Child process %d exited: %v", result.Pid, result.Err)
-		log.Warnf("Waiting for file change to restart command")
-		
-		// Wait for an update to restart.
-		<-updateChannel
-		return
-	case <-updateChannel:
-		// Got an update without an exit. Continue.
 	}
-	
-	log.Infof("File system changed; restarting")
-	
+}
+
+func killAll(pgid int, exitChannel chan ChildExit) error {
 	// The child needs to be restarted
 	log.Debugf("Sending SIGTERM to child process group %d", pgid)
 	err := syscall.Kill(-pgid, syscall.Signal(syscall.SIGTERM))
@@ -126,18 +162,30 @@ func runUntil(command []string, updateChannel chan bool) {
 
 	select {
 	case result := <-exitChannel:
-		if result.Err == nil {
-			log.Infof("Child process %d exited: success", result.Pid)
-			os.Exit(0)
-		}
+		return result.Err
 	case <-time.After(500 * time.Millisecond):
-		log.Debugf("Sending SIGKILL to child process group %d", pgid)
-		err = syscall.Kill(-pgid, syscall.Signal(syscall.SIGKILL))
-		if err != nil {
-			log.Warnf("Error killing process [%v]: %v", reflect.TypeOf(err), err)
-		}
-		/// FIXME we should check that it's actually dead.
+		// Continue
 	}
+	
+	log.Debugf("Sending SIGKILL to child process group %d", pgid)
+	err = syscall.Kill(-pgid, syscall.Signal(syscall.SIGKILL))
+	if err != nil {
+		log.Warnf("Error killing process group: %v [%v]",
+			err, reflect.TypeOf(err))
+	}
+	
+	select {
+	case result := <-exitChannel:
+		return result.Err
+	case <-time.After(500 * time.Millisecond):
+		log.Fatalf("Could not kill process group %d", pgid)
+	}
+	
+	panic("Invalid point in code")
+}
+
+func isKillSignal(s os.Signal) bool {
+	return int(s.(syscall.Signal)) <= int(syscall.SIGTERM)
 }
 
 type ChildExit struct {

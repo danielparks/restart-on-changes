@@ -83,16 +83,16 @@ func runUntil(command []string, updateChannel chan bool) {
 		select {
 		case s = <-signalChannel:
 			if isKillSignal(s) {
-				log.Debugf("Received signal %v: killing all processes", s)
+				log.Debugf("Received signal %q: killing all processes", s)
 				_ = killAll(pgid, exitChannel)
 				os.Exit(128 + int(s.(syscall.Signal))) // Exit code includes signal
 			}
 
 			// Pass the signal along. FIXME: only to immediate child?
-			log.Debugf("Received signal %v: passing it to all processes", s)
+			log.Debugf("Received signal %q: passing it to all processes", s)
 			err := syscall.Kill(-pgid, s.(syscall.Signal))
 			if err != nil {
-				log.Warnf("Could not pass received signal %v to children", s)
+				log.Warnf("Could not pass received signal %q to children", s)
 			}
 
 			// Loop
@@ -144,8 +144,8 @@ func killAll(pgid int, exitChannel chan ChildExit) error {
 	log.Debugf("Sending SIGKILL to child process group %d", pgid)
 	err = syscall.Kill(-pgid, syscall.Signal(syscall.SIGKILL))
 	if err != nil {
-		log.Warnf("Error killing process group: %v [%v]",
-			err, reflect.TypeOf(err))
+		log.Warnf("Error killing process group[%v]: %v",
+			reflect.TypeOf(err), err)
 	}
 
 	select {
@@ -211,8 +211,8 @@ func getPgid(pid int) int {
 					pid, err, err)
 			}
 		default:
-			log.Fatalf("Could not get process group for child %d: %v [%v]",
-				pid, err, reflect.TypeOf(err))
+			log.Fatalf("Could not get process group for child %d [%v]: %v",
+				pid, reflect.TypeOf(err), err)
 		}
 	}
 

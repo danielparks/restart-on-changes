@@ -263,7 +263,7 @@ func watchPath(updateChan chan bool, path string) {
 		Paths:   []string{path},
 		Latency: 500 * time.Millisecond,
 		Device:  device,
-		Flags:   fsevents.FileEvents | fsevents.WatchRoot,
+		Flags:   fsevents.FileEvents | fsevents.IgnoreSelf,
 	}
 	stream.Start()
 

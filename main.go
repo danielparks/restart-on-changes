@@ -318,11 +318,25 @@ var noteDescription = map[fsevents.EventFlags]string{
 }
 
 func logEvent(event fsevents.Event) {
+	/// FIXME this silently skips events not listed above
 	note := ""
 	for bit, description := range noteDescription {
 		if event.Flags&bit == bit {
 			note += description + " "
 		}
 	}
-	log.Debugf("EventID: %d Path: %s Flags: %s", event.ID, event.Path, note)
+
+	changeBits := fsevents.ItemCreated |
+		fsevents.ItemModified |
+		fsevents.ItemRemoved |
+		fsevents.ItemRenamed |
+		fsevents.ItemModified |
+		fsevents.ItemInodeMetaMod | // chmod and touch
+		fsevents.ItemChangeOwner
+
+	if event.Flags&fsevents.ItemIsDir == 0 && event.Flags&changeBits > 0 {
+		log.Debugf("Handle %s Flags: %s", event.Path, note)
+	} else {
+		log.Debugf("Ignore %s Flags: %s", event.Path, note)
+	}
 }

@@ -58,9 +58,9 @@ func main() {
 
 	paths := []string{path}
 
-	updateChannel := make(chan bool)
+	updateChan := make(chan bool)
 	for _, path := range paths {
-		go watchPath(updateChannel, path)
+		go watchPath(updateChan, path)
 	}
 
 	if norun {
@@ -71,75 +71,65 @@ func main() {
 		// This loop never exits.
 		for {
 			select {
-			case <-updateChannel:
+			case <-updateChan:
 			}
 		}
 	}
 
 	// This loop never exits.
 	for {
-		runUntil(flag.Args(), updateChannel)
+		runUntil(flag.Args(), updateChan)
 		log.Warnf("Restarting child process")
 	}
 }
 
-func runUntil(command []string, updateChannel chan bool) {
-	pgidChannel := make(chan int)
-	exitChannel := make(chan ChildExit)
+func runUntil(command []string, updateChan chan bool) {
+	pgidChan := make(chan int)
+	exitChan := make(chan ChildExit)
 
 	// Signals do not block, so there must be a buffer:
-	signalChannel := make(chan os.Signal, 5)
-	signal.Notify(signalChannel)
+	signalChan := make(chan os.Signal, 5)
+	signal.Notify(signalChan)
 
 	log.Debugf("Starting child process")
-	go runCommand(pgidChannel, exitChannel, command)
-	pgid := <-pgidChannel
+	go runCommand(pgidChan, exitChan, command)
+	pgid := <-pgidChan
 
-	var s os.Signal
 	var result ChildExit
 
 	for {
 		select {
-		case s = <-signalChannel:
-			if isKillSignal(s) {
-				log.Debugf("Received signal %q: killing all processes", s)
-				err := killAll(pgid, exitChannel)
-				if err != nil {
-					log.Errorf("Could not kill process group %d: %v", pgid, err)
-				}
-				os.Exit(128 + int(s.(syscall.Signal))) // Exit code includes signal
-			}
-
-			// Pass the signal along. FIXME: only to immediate child?
-			log.Debugf("Received signal %q: passing it to all processes", s)
-			err := syscall.Kill(-pgid, s.(syscall.Signal))
-			if err != nil {
-				log.Warnf("Could not pass received signal %q to children", s)
-			}
-
-			// Loop
-		case result = <-exitChannel:
-			// We got an exit before a file system update.
-			if result.Err == nil {
-				log.Infof("Child process %d exited: success", result.Pid)
-				os.Exit(0)
-			}
-
-			signal.Reset()
-			log.Warnf("Child process %d exited: %v", result.Pid, result.Err)
-
-			log.Warnf("Waiting for file change to restart command")
-			<-updateChannel
-
+		case signal := <-signalChan:
+			handleSignal(signal.(syscall.Signal), pgid, exitChan)
+		case result = <-exitChan:
+			handleChildExit(result, updateChan)
+			return // Restart child process
+		case <-updateChan:
+			handleUpdate(pgid, updateChan, signalChan, exitChan)
 			return
-		case <-updateChannel:
-			// Got an update without an exit.
-			log.Infof("File system changed; restarting")
+		}
+	}
+}
 
+func handleUpdate(pgid int, updateChan chan bool, signalChan chan os.Signal, exitChan chan ChildExit) {
+	// We wait this long for additional events before restarting the child.
+	patiencePeriod := 100 * time.Millisecond
+
+	for {
+		select {
+		case signal := <-signalChan:
+			handleSignal(signal.(syscall.Signal), pgid, exitChan)
+		case result := <-exitChan:
+			handleChildExit(result, updateChan)
+			return
+		case <-updateChan:
+			// Don't care
+		case <-time.After(patiencePeriod):
+			log.Debugf("patience Chan unblocked")
 			// The child needs to be restarted
-			err := killAll(pgid, exitChannel)
+			err := killAll(pgid, exitChan)
 			if err != nil {
-				log.Fatalf("Could not kill process group %d: %v", result.Pid, err)
+				log.Fatalf("Could not kill process group %d: %v", pgid, err)
 			}
 
 			return
@@ -147,9 +137,41 @@ func runUntil(command []string, updateChannel chan bool) {
 	}
 }
 
+func handleSignal(signal syscall.Signal, pgid int, exitChan chan ChildExit) {
+	if isKillSignal(signal) {
+		log.Debugf("Received signal %q: killing all processes", signal)
+		err := killAll(pgid, exitChan)
+		if err != nil {
+			log.Errorf("Could not kill process group %d: %v", pgid, err)
+		}
+		os.Exit(128 + int(signal)) // Exit code includes signal
+	}
+
+	// Pass the signal along. FIXME: only to immediate child?
+	log.Debugf("Received signal %q: passing it to all processes", signal)
+	err := syscall.Kill(-pgid, signal)
+	if err != nil {
+		log.Warnf("Could not pass received signal %q to children: %v", signal, err)
+	}
+}
+
+func handleChildExit(result ChildExit, updateChan chan bool) {
+	// We got an exit before a file system update.
+	if result.Err == nil {
+		log.Infof("Child process %d exited: success", result.Pid)
+		os.Exit(0)
+	}
+
+	signal.Reset()
+	log.Warnf("Child process %d exited: %v", result.Pid, result.Err)
+
+	log.Warnf("Waiting for file change to restart command")
+	<-updateChan
+}
+
 var ErrTimeout = fmt.Errorf("timed out")
 
-func signalProcess(pid int, signal syscall.Signal, exitChannel chan ChildExit) error {
+func signalProcess(pid int, signal syscall.Signal, exitChan chan ChildExit) error {
 	target := fmt.Sprintf("process %d", pid)
 	if pid < 0 {
 		target = fmt.Sprintf("process group %d", -pid)
@@ -164,7 +186,7 @@ func signalProcess(pid int, signal syscall.Signal, exitChannel chan ChildExit) e
 
 	timeout := 500 * time.Millisecond
 	select {
-	case <-exitChannel:
+	case <-exitChan:
 		return nil // It's no longer running
 	case <-time.After(timeout):
 		log.Warnf("Timed out sending %v to %s after %v", signal, target, timeout)
@@ -172,11 +194,11 @@ func signalProcess(pid int, signal syscall.Signal, exitChannel chan ChildExit) e
 	}
 }
 
-func killAll(pgid int, exitChannel chan ChildExit) error {
+func killAll(pgid int, exitChan chan ChildExit) error {
 	// signalProcess handles logging
-	err := signalProcess(-pgid, syscall.SIGTERM, exitChannel)
+	err := signalProcess(-pgid, syscall.SIGTERM, exitChan)
 	if err != nil {
-		err = signalProcess(-pgid, syscall.SIGKILL, exitChannel)
+		err = signalProcess(-pgid, syscall.SIGKILL, exitChan)
 		if err != nil {
 			return err
 		}
@@ -194,7 +216,7 @@ type ChildExit struct {
 	Err error
 }
 
-func runCommand(pgidChannel chan int, exitChannel chan ChildExit, args []string) {
+func runCommand(pgidChan chan int, exitChan chan ChildExit, args []string) {
 	child := exec.Command(args[0], args[1:]...)
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
@@ -217,11 +239,11 @@ func runCommand(pgidChannel chan int, exitChannel chan ChildExit, args []string)
 	// exit code, so we'll just skip straight to that.
 	if pgid > 0 {
 		log.Debugf("Child process %d (PGID %d) started %v", pid, pgid, args)
-		pgidChannel <- pgid
+		pgidChan <- pgid
 	}
 
 	err = child.Wait()
-	exitChannel <- ChildExit{pid, err}
+	exitChan <- ChildExit{pid, err}
 }
 
 // Returns 0 if the process is not found
@@ -246,7 +268,7 @@ func getPgid(pid int) int {
 	return pgid
 }
 
-func watchPath(updateChannel chan bool, path string) {
+func watchPath(updateChan chan bool, path string) {
 	log.Debugf("Watching path %q", path)
 
 	/// FIXME: aggregate paths per device?
@@ -267,7 +289,7 @@ func watchPath(updateChannel chan bool, path string) {
 		for _, event := range msg {
 			logEvent(event)
 		}
-		updateChannel <- true
+		updateChan <- true
 	}
 	log.Fatalf("Ran out of events for path %q", path)
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"github.com/fsnotify/fsevents"
 	log "github.com/sirupsen/logrus"
 	"os"
@@ -84,7 +85,10 @@ func runUntil(command []string, updateChannel chan bool) {
 		case s = <-signalChannel:
 			if isKillSignal(s) {
 				log.Debugf("Received signal %q: killing all processes", s)
-				_ = killAll(pgid, exitChannel)
+				err := killAll(pgid, exitChannel)
+				if err != nil {
+					log.Errorf("Could not kill process group %d: %v", pgid, err)
+				}
 				os.Exit(128 + int(s.(syscall.Signal))) // Exit code includes signal
 			}
 
@@ -116,9 +120,8 @@ func runUntil(command []string, updateChannel chan bool) {
 
 			// The child needs to be restarted
 			err := killAll(pgid, exitChannel)
-			if err == nil {
-				log.Infof("Child process %d exited: success", result.Pid)
-				os.Exit(0)
+			if err != nil {
+				log.Fatalf("Could not kill process group %d: %v", result.Pid, err)
 			}
 
 			return
@@ -126,36 +129,42 @@ func runUntil(command []string, updateChannel chan bool) {
 	}
 }
 
+var ErrTimeout = fmt.Errorf("timed out")
+
+func signalProcess(pid int, signal syscall.Signal, exitChannel chan ChildExit) error {
+	target := fmt.Sprintf("process %d", pid)
+	if pid < 0 {
+		target = fmt.Sprintf("process group %d", -pid)
+	}
+
+	log.Debugf("Sending %v to %s", signal, target)
+	err := syscall.Kill(pid, signal)
+	if err != nil {
+		log.Warnf("Error sending %v to %s: %v (%T)", signal, target, err, err)
+		return err
+	}
+
+	timeout := 500 * time.Millisecond
+	select {
+	case <-exitChannel:
+		return nil // It's no longer running
+	case <-time.After(timeout):
+		log.Warnf("Timed out sending %v to %s after %v", signal, target, timeout)
+		return ErrTimeout
+	}
+}
+
 func killAll(pgid int, exitChannel chan ChildExit) error {
-	// The child needs to be restarted
-	log.Debugf("Sending SIGTERM to child process group %d", pgid)
-	err := syscall.Kill(-pgid, syscall.Signal(syscall.SIGTERM))
+	// signalProcess handles logging
+	err := signalProcess(-pgid, syscall.SIGTERM, exitChannel)
 	if err != nil {
-		log.Warnf("Error killing process [%v]: %v", reflect.TypeOf(err), err)
+		err = signalProcess(-pgid, syscall.SIGKILL, exitChannel)
+		if err != nil {
+			return err
+		}
 	}
 
-	select {
-	case result := <-exitChannel:
-		return result.Err
-	case <-time.After(500 * time.Millisecond):
-		// Continue
-	}
-
-	log.Debugf("Sending SIGKILL to child process group %d", pgid)
-	err = syscall.Kill(-pgid, syscall.Signal(syscall.SIGKILL))
-	if err != nil {
-		log.Warnf("Error killing process group[%v]: %v",
-			reflect.TypeOf(err), err)
-	}
-
-	select {
-	case result := <-exitChannel:
-		return result.Err
-	case <-time.After(500 * time.Millisecond):
-		log.Fatalf("Could not kill process group %d", pgid)
-	}
-
-	panic("Invalid point in code")
+	return nil
 }
 
 func isKillSignal(s os.Signal) bool {

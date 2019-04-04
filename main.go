@@ -105,35 +105,17 @@ func runUntil(command []string, updateChan chan bool) {
 			handleChildExit(result, updateChan)
 			return // Restart child process
 		case <-updateChan:
-			handleUpdate(pgid, updateChan, signalChan, exitChan)
-			return
+			handleUpdate(pgid, exitChan)
+			return // Restart child process
 		}
 	}
 }
 
-func handleUpdate(pgid int, updateChan chan bool, signalChan chan os.Signal, exitChan chan ChildExit) {
-	// We wait this long for additional events before restarting the child.
-	patiencePeriod := 100 * time.Millisecond
-
-	for {
-		select {
-		case signal := <-signalChan:
-			handleSignal(signal.(syscall.Signal), pgid, exitChan)
-		case result := <-exitChan:
-			handleChildExit(result, updateChan)
-			return
-		case <-updateChan:
-			// Don't care
-		case <-time.After(patiencePeriod):
-			log.Debugf("patience Chan unblocked")
-			// The child needs to be restarted
-			err := killAll(pgid, exitChan)
-			if err != nil {
-				log.Fatalf("Could not kill process group %d: %v", pgid, err)
-			}
-
-			return
-		}
+func handleUpdate(pgid int, exitChan chan ChildExit) {
+	// The child needs to be restarted
+	err := killAll(pgid, exitChan)
+	if err != nil {
+		log.Fatalf("Could not kill process group %d: %v", pgid, err)
 	}
 }
 

@@ -26,9 +26,12 @@ func (formatter *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 	}
 }
 
-var verbose bool
-var debug bool
-var path string
+var (
+	path    string
+	verbose bool
+	debug   bool
+	norun   bool
+)
 
 func init() {
 	flag.StringVar(&path, "path", ".", "Path to watch")
@@ -37,6 +40,7 @@ func init() {
 	flag.BoolVar(&verbose, "v", false, "Output more information (shorthand)")
 	flag.BoolVar(&debug, "debug", false, "Output debugging information")
 	flag.BoolVar(&debug, "d", false, "Output debugging information (shorthand)")
+	flag.BoolVar(&norun, "norun", false, "Don't run the command, just watch the path")
 
 	log.SetFormatter(&LogFormatter{})
 }
@@ -59,6 +63,20 @@ func main() {
 		go watchPath(updateChannel, path)
 	}
 
+	if norun {
+		if len(flag.Args()) > 0 {
+			log.Warnf("Not running command since -norun was specified")
+		}
+
+		// This loop never exits.
+		for {
+			select {
+			case <-updateChannel:
+			}
+		}
+	}
+
+	// This loop never exits.
 	for {
 		runUntil(flag.Args(), updateChannel)
 		log.Warnf("Restarting child process")

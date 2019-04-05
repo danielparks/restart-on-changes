@@ -3,12 +3,14 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/bmatcuk/doublestar"
 	"github.com/fsnotify/fsevents"
 	log "github.com/sirupsen/logrus"
 	"os"
 	"os/exec"
 	"os/signal"
 	"reflect"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -27,15 +29,18 @@ func (formatter *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 }
 
 var (
-	path    string
-	verbose bool
-	debug   bool
-	norun   bool
+	pathToWatch string
+	exclude     string
+	verbose     bool
+	debug       bool
+	norun       bool
 )
 
 func init() {
-	flag.StringVar(&path, "path", ".", "Path to watch")
-	flag.StringVar(&path, "p", ".", "Path to watch (shorthand)")
+	flag.StringVar(&pathToWatch, "path", ".", "Path to watch")
+	flag.StringVar(&pathToWatch, "p", ".", "Path to watch (shorthand)")
+	flag.StringVar(&exclude, "exclude", "", "Paths to exclude")
+	flag.StringVar(&exclude, "x", "", "Paths to exclude")
 	flag.BoolVar(&verbose, "verbose", false, "Output more information")
 	flag.BoolVar(&verbose, "v", false, "Output more information (shorthand)")
 	flag.BoolVar(&debug, "debug", false, "Output debugging information")
@@ -56,11 +61,18 @@ func main() {
 		log.SetLevel(log.WarnLevel)
 	}
 
-	paths := []string{path}
+	if exclude != "" {
+		_, err := doublestar.PathMatch(exclude, ".")
+		if err != nil {
+			log.Fatalf("Invalid glob in exclude pattern %q", exclude)
+		}
+	}
+
+	paths := []string{pathToWatch}
 
 	updateChan := make(chan bool)
-	for _, path := range paths {
-		go watchPath(updateChan, path)
+	for _, p := range paths {
+		go watchPath(updateChan, p)
 	}
 
 	if norun {
@@ -250,17 +262,48 @@ func getPgid(pid int) int {
 	return pgid
 }
 
-func watchPath(updateChan chan bool, path string) {
-	log.Debugf("Watching path %q", path)
+func devicePrefixForPath(device int32, p string) string {
+	stream := &fsevents.EventStream{
+		Paths:   []string{p},
+		Latency: 0,
+		Device:  device,
+		Flags:   fsevents.FileEvents,
+	}
+	stream.Start()
 
-	/// FIXME: aggregate paths per device?
-	device, err := fsevents.DeviceForPath(path)
+	// Trigger event to get its path.
+	err := os.Chtimes(p, time.Now(), time.Now())
 	if err != nil {
-		log.Fatalf("Failed to retrieve device for path: %v", err)
+		log.Fatalf("Failed set atime/mtime on %q: %v", p, err)
 	}
 
+	prefix := ""
+	prefixFound := false
+
+	// If there are multiple events, the shortest path must be ours.
+	msg := <-stream.Events
+	for _, event := range msg {
+		if !prefixFound || len(event.Path) < len(prefix) {
+			prefix = event.Path
+		}
+	}
+
+	log.Debugf("got device path prefix %q for path %q", prefix, p)
+
+	return prefix
+}
+
+func watchPath(updateChan chan bool, p string) {
+	/// FIXME: aggregate paths per device?
+	device, err := fsevents.DeviceForPath(p)
+	if err != nil {
+		log.Fatalf("Failed to retrieve device for path %q: %v", p, err)
+	}
+
+	prefix := devicePrefixForPath(device, p) + "/"
+
 	stream := &fsevents.EventStream{
-		Paths:   []string{path},
+		Paths:   []string{p},
 		Latency: 500 * time.Millisecond,
 		Device:  device,
 		Flags:   fsevents.FileEvents | fsevents.IgnoreSelf,
@@ -269,11 +312,52 @@ func watchPath(updateChan chan bool, path string) {
 
 	for msg := range stream.Events {
 		for _, event := range msg {
-			logEvent(event)
+			if shouldUpdate(prefix, event) {
+				logEvent(prefix, event)
+				updateChan <- true
+				break // skip the rest of msg
+			}
 		}
-		updateChan <- true
 	}
-	log.Fatalf("Ran out of events for path %q", path)
+	log.Fatalf("Ran out of events for path %q", p)
+}
+
+var importantEventBits =
+	fsevents.ItemCreated |
+	fsevents.ItemModified |
+	fsevents.ItemRemoved |
+	fsevents.ItemRenamed |
+	fsevents.ItemModified |
+	fsevents.ItemInodeMetaMod | // chmod and touch
+	fsevents.ItemChangeOwner
+
+func shouldUpdate(prefix string, event fsevents.Event) bool {
+	relativePath := strings.TrimPrefix(event.Path, prefix)
+
+	if exclude != "" {
+		matched, err := doublestar.PathMatch(exclude, relativePath)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if matched {
+			log.Debugf("Ignoring events on excluded path %s", relativePath)
+			return false
+		}
+	}
+
+	if event.Flags&fsevents.ItemIsDir > 0 {
+		log.Debugf("Ignoring events on directory %s", relativePath)
+		return false
+	}
+
+	if event.Flags&importantEventBits == 0 {
+		// Unimportant event
+		return false
+	}
+
+	// This will be logged outside
+	return true
 }
 
 var noteDescription = map[fsevents.EventFlags]string{
@@ -299,8 +383,8 @@ var noteDescription = map[fsevents.EventFlags]string{
 	fsevents.ItemIsSymlink:     "IsSymLink",
 }
 
-func logEvent(event fsevents.Event) {
-	/// FIXME this silently skips events not listed above
+func logEvent(prefix string, event fsevents.Event) {
+	/// FIXME this silently skips events not listed above (if there are any)
 	note := ""
 	for bit, description := range noteDescription {
 		if event.Flags&bit == bit {
@@ -308,17 +392,5 @@ func logEvent(event fsevents.Event) {
 		}
 	}
 
-	changeBits := fsevents.ItemCreated |
-		fsevents.ItemModified |
-		fsevents.ItemRemoved |
-		fsevents.ItemRenamed |
-		fsevents.ItemModified |
-		fsevents.ItemInodeMetaMod | // chmod and touch
-		fsevents.ItemChangeOwner
-
-	if event.Flags&fsevents.ItemIsDir == 0 && event.Flags&changeBits > 0 {
-		log.Debugf("Handle %s Flags: %s", event.Path, note)
-	} else {
-		log.Debugf("Ignore %s Flags: %s", event.Path, note)
-	}
+	log.Debugf("%s events: %s", strings.TrimPrefix(event.Path, prefix), note)
 }

@@ -1,19 +1,49 @@
 package main
 
 import (
-	"flag"
 	"fmt"
+	"github.com/DavidGamba/go-getoptions"
 	"github.com/bmatcuk/doublestar"
 	"github.com/fsnotify/fsevents"
 	"github.com/sirupsen/logrus"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"reflect"
 	"strings"
 	"syscall"
 	"time"
 )
+
+func main() {
+	logrus.SetFormatter(&LogFormatter{})
+
+	command, paths, excludes := processOptions()
+
+	updateChan := make(chan bool)
+	for _, p := range paths {
+		go watchPath(updateChan, p, excludes)
+	}
+
+	if len(command) == 0 {
+		// Don't run, just watch the file system
+		if logrus.GetLevel() < logrus.InfoLevel { // if not warning or above
+			logrus.SetLevel(logrus.InfoLevel) // otherwise there will be no output
+		}
+
+		// This loop never exits.
+		for {
+			<-updateChan
+		}
+	}
+
+	// Run the command. This loop never exits.
+	for {
+		runUntil(command, updateChan)
+		logrus.Warnf("Restarting child process")
+	}
+}
 
 var RealFormatter = &logrus.TextFormatter{}
 
@@ -28,71 +58,67 @@ func (formatter *LogFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 	}
 }
 
-var (
-	pathToWatch string
-	exclude     string
-	verbose     bool
-	debug       bool
-	norun       bool
-)
+func processOptions() (command, paths, excludes []string) {
+	opt := getoptions.New()
+	opt.Bool("help", false, opt.Alias("h", "?"))
+	opt.Bool("debug", false, opt.Alias("d"))
+	opt.Bool("verbose", false, opt.Alias("v"))
 
-func init() {
-	flag.StringVar(&pathToWatch, "path", ".", "Path to watch")
-	flag.StringVar(&pathToWatch, "p", ".", "Path to watch (shorthand)")
-	flag.StringVar(&exclude, "exclude", "", "Paths to exclude")
-	flag.StringVar(&exclude, "x", "", "Paths to exclude")
-	flag.BoolVar(&verbose, "verbose", false, "Output more information")
-	flag.BoolVar(&verbose, "v", false, "Output more information (shorthand)")
-	flag.BoolVar(&debug, "debug", false, "Output debugging information")
-	flag.BoolVar(&debug, "d", false, "Output debugging information (shorthand)")
-	flag.BoolVar(&norun, "norun", false, "Don't run the command, just watch the path")
+	pathsPtr := opt.StringSlice("path", 1, 1, opt.Alias("p"),
+		opt.Description("Paths to watch. Defaults to the current directory."))
 
-	logrus.SetFormatter(&LogFormatter{})
-}
+	excludesPtr := opt.StringSlice("exclude", 1, 1, opt.Alias("x"), opt.ArgName("glob"),
+		opt.Description("Paths to exclude. Use **/ to match any descendents."))
 
-func main() {
-	flag.Parse()
+	opt.SetMode("bundling") // -opt == -o -p -t
+	opt.SetRequireOrder()   // stop processing after the first argument is found
 
-	if debug {
+	command, err := opt.Parse(os.Args[1:])
+	if err != nil {
+		logrus.Errorf("Error parsing arguments: %v", err)
+		fmt.Fprintf(os.Stderr, opt.Help())
+		os.Exit(1)
+	}
+
+	if opt.Called("help") {
+		fmt.Print(opt.Help())
+		os.Exit(0)
+	}
+
+	if opt.Called("debug") {
 		logrus.SetLevel(logrus.DebugLevel)
-	} else if verbose {
+	} else if opt.Called("verbose") {
 		logrus.SetLevel(logrus.InfoLevel)
 	} else {
 		logrus.SetLevel(logrus.WarnLevel)
 	}
 
-	if exclude != "" {
-		_, err := doublestar.PathMatch(exclude, ".")
+	// Default to watching the current directory.
+	paths = *pathsPtr
+	if len(paths) == 0 {
+		paths = []string{"."}
+	}
+
+	excludes = []string{}
+	for _, glob := range *excludesPtr {
+		excludes = append(excludes, glob)
+		_, err = doublestar.PathMatch(glob, ".")
 		if err != nil {
-			logrus.Fatalf("Invalid glob in exclude pattern %q", exclude)
+			logrus.Fatalf("Invalid glob in exclude pattern %q", glob)
+		}
+
+		// When glob matches a directory we want to exclude its descendants too.
+		glob = path.Join(glob, "**")
+		excludes = append(excludes, glob)
+		_, err = doublestar.PathMatch(glob, ".")
+		if err != nil {
+			logrus.Fatalf("Invalid glob in exclude pattern %q", glob)
 		}
 	}
 
-	paths := []string{pathToWatch}
+	logrus.Debugf("Excluding: %v", excludes)
 
-	updateChan := make(chan bool)
-	for _, p := range paths {
-		go watchPath(updateChan, p)
-	}
-
-	if norun {
-		if len(flag.Args()) > 0 {
-			logrus.Warnf("Not running command since -norun was specified")
-		}
-
-		// This loop never exits.
-		for {
-			select {
-			case <-updateChan:
-			}
-		}
-	}
-
-	// This loop never exits.
-	for {
-		runUntil(flag.Args(), updateChan)
-		logrus.Warnf("Restarting child process")
-	}
+	return
 }
 
 func runUntil(command []string, updateChan chan bool) {
@@ -293,7 +319,7 @@ func devicePrefixForPath(device int32, p string) string {
 	return prefix
 }
 
-func watchPath(updateChan chan bool, p string) {
+func watchPath(updateChan chan bool, p string, excludes []string) {
 	/// FIXME: aggregate paths per device?
 	device, err := fsevents.DeviceForPath(p)
 	if err != nil {
@@ -312,7 +338,7 @@ func watchPath(updateChan chan bool, p string) {
 
 	for msg := range stream.Events {
 		for _, event := range msg {
-			if shouldUpdate(prefix, event) {
+			if shouldUpdate(prefix, event, excludes) {
 				logEvent(prefix, event)
 				updateChan <- true
 				break // skip the rest of msg
@@ -322,8 +348,7 @@ func watchPath(updateChan chan bool, p string) {
 	logrus.Fatalf("Ran out of events for path %q", p)
 }
 
-var importantEventBits =
-	fsevents.ItemCreated |
+var importantEventBits = fsevents.ItemCreated |
 	fsevents.ItemModified |
 	fsevents.ItemRemoved |
 	fsevents.ItemRenamed |
@@ -331,11 +356,11 @@ var importantEventBits =
 	fsevents.ItemInodeMetaMod | // chmod and touch
 	fsevents.ItemChangeOwner
 
-func shouldUpdate(prefix string, event fsevents.Event) bool {
+func shouldUpdate(prefix string, event fsevents.Event, excludes []string) bool {
 	relativePath := strings.TrimPrefix(event.Path, prefix)
 
-	if exclude != "" {
-		matched, err := doublestar.PathMatch(exclude, relativePath)
+	for _, glob := range excludes {
+		matched, err := doublestar.PathMatch(glob, relativePath)
 		if err != nil {
 			logrus.Fatal(err)
 		}
@@ -392,5 +417,5 @@ func logEvent(prefix string, event fsevents.Event) {
 		}
 	}
 
-	logrus.Debugf("%s events: %s", strings.TrimPrefix(event.Path, prefix), note)
+	logrus.Infof("%s events: %s", strings.TrimPrefix(event.Path, prefix), note)
 }

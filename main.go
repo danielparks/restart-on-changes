@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/bmatcuk/doublestar"
 	"github.com/fsnotify/fsevents"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -15,11 +15,11 @@ import (
 	"time"
 )
 
-var RealFormatter = &log.TextFormatter{}
+var RealFormatter = &logrus.TextFormatter{}
 
 type LogFormatter struct{}
 
-func (formatter *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
+func (formatter *LogFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 	b, err := RealFormatter.Format(entry)
 	if err == nil {
 		return append([]byte("restart-on-changes "), b...), nil
@@ -47,24 +47,24 @@ func init() {
 	flag.BoolVar(&debug, "d", false, "Output debugging information (shorthand)")
 	flag.BoolVar(&norun, "norun", false, "Don't run the command, just watch the path")
 
-	log.SetFormatter(&LogFormatter{})
+	logrus.SetFormatter(&LogFormatter{})
 }
 
 func main() {
 	flag.Parse()
 
 	if debug {
-		log.SetLevel(log.DebugLevel)
+		logrus.SetLevel(logrus.DebugLevel)
 	} else if verbose {
-		log.SetLevel(log.InfoLevel)
+		logrus.SetLevel(logrus.InfoLevel)
 	} else {
-		log.SetLevel(log.WarnLevel)
+		logrus.SetLevel(logrus.WarnLevel)
 	}
 
 	if exclude != "" {
 		_, err := doublestar.PathMatch(exclude, ".")
 		if err != nil {
-			log.Fatalf("Invalid glob in exclude pattern %q", exclude)
+			logrus.Fatalf("Invalid glob in exclude pattern %q", exclude)
 		}
 	}
 
@@ -77,7 +77,7 @@ func main() {
 
 	if norun {
 		if len(flag.Args()) > 0 {
-			log.Warnf("Not running command since -norun was specified")
+			logrus.Warnf("Not running command since -norun was specified")
 		}
 
 		// This loop never exits.
@@ -91,7 +91,7 @@ func main() {
 	// This loop never exits.
 	for {
 		runUntil(flag.Args(), updateChan)
-		log.Warnf("Restarting child process")
+		logrus.Warnf("Restarting child process")
 	}
 }
 
@@ -103,7 +103,7 @@ func runUntil(command []string, updateChan chan bool) {
 	signalChan := make(chan os.Signal, 5)
 	signal.Notify(signalChan)
 
-	log.Debugf("Starting child process")
+	logrus.Debugf("Starting child process")
 	go runCommand(pgidChan, exitChan, command)
 	pgid := <-pgidChan
 
@@ -127,39 +127,39 @@ func handleUpdate(pgid int, exitChan chan ChildExit) {
 	// The child needs to be restarted
 	err := killAll(pgid, exitChan)
 	if err != nil {
-		log.Fatalf("Could not kill process group %d: %v", pgid, err)
+		logrus.Fatalf("Could not kill process group %d: %v", pgid, err)
 	}
 }
 
 func handleSignal(signal syscall.Signal, pgid int, exitChan chan ChildExit) {
 	if isKillSignal(signal) {
-		log.Debugf("Received signal %q: killing all processes", signal)
+		logrus.Debugf("Received signal %q: killing all processes", signal)
 		err := killAll(pgid, exitChan)
 		if err != nil {
-			log.Errorf("Could not kill process group %d: %v", pgid, err)
+			logrus.Errorf("Could not kill process group %d: %v", pgid, err)
 		}
 		os.Exit(128 + int(signal)) // Exit code includes signal
 	}
 
 	// Pass the signal along. FIXME: only to immediate child?
-	log.Debugf("Received signal %q: passing it to all processes", signal)
+	logrus.Debugf("Received signal %q: passing it to all processes", signal)
 	err := syscall.Kill(-pgid, signal)
 	if err != nil {
-		log.Warnf("Could not pass received signal %q to children: %v", signal, err)
+		logrus.Warnf("Could not pass received signal %q to children: %v", signal, err)
 	}
 }
 
 func handleChildExit(result ChildExit, updateChan chan bool) {
 	// We got an exit before a file system update.
 	if result.Err == nil {
-		log.Infof("Child process %d exited: success", result.Pid)
+		logrus.Infof("Child process %d exited: success", result.Pid)
 		os.Exit(0)
 	}
 
 	signal.Reset()
-	log.Warnf("Child process %d exited: %v", result.Pid, result.Err)
+	logrus.Warnf("Child process %d exited: %v", result.Pid, result.Err)
 
-	log.Warnf("Waiting for file change to restart command")
+	logrus.Warnf("Waiting for file change to restart command")
 	<-updateChan
 }
 
@@ -171,10 +171,10 @@ func signalProcess(pid int, signal syscall.Signal, exitChan chan ChildExit) erro
 		target = fmt.Sprintf("process group %d", -pid)
 	}
 
-	log.Debugf("Sending %v to %s", signal, target)
+	logrus.Debugf("Sending %v to %s", signal, target)
 	err := syscall.Kill(pid, signal)
 	if err != nil {
-		log.Warnf("Error sending %v to %s: %v (%T)", signal, target, err, err)
+		logrus.Warnf("Error sending %v to %s: %v (%T)", signal, target, err, err)
 		return err
 	}
 
@@ -183,7 +183,7 @@ func signalProcess(pid int, signal syscall.Signal, exitChan chan ChildExit) erro
 	case <-exitChan:
 		return nil // It's no longer running
 	case <-time.After(timeout):
-		log.Warnf("Timed out sending %v to %s after %v", signal, target, timeout)
+		logrus.Warnf("Timed out sending %v to %s after %v", signal, target, timeout)
 		return ErrTimeout
 	}
 }
@@ -220,10 +220,10 @@ func runCommand(pgidChan chan int, exitChan chan ChildExit, args []string) {
 	// descendants all at once.
 	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	log.Debugf("Starting %v", args)
+	logrus.Debugf("Starting %v", args)
 	err := child.Start()
 	if err != nil {
-		log.Fatalf("Could not start %v: %v", args, err)
+		logrus.Fatalf("Could not start %v: %v", args, err)
 	}
 
 	pid := child.Process.Pid
@@ -232,7 +232,7 @@ func runCommand(pgidChan chan int, exitChan chan ChildExit, args []string) {
 	// If the process wasn't found, pgid will be 0. child.Wait() will return the
 	// exit code, so we'll just skip straight to that.
 	if pgid > 0 {
-		log.Debugf("Child process %d (PGID %d) started %v", pid, pgid, args)
+		logrus.Debugf("Child process %d (PGID %d) started %v", pid, pgid, args)
 		pgidChan <- pgid
 	}
 
@@ -250,11 +250,11 @@ func getPgid(pid int) int {
 				// Not found
 				return 0
 			} else {
-				log.Fatalf("Could not get process group for child %d: %v (errno %d)",
+				logrus.Fatalf("Could not get process group for child %d: %v (errno %d)",
 					pid, err, err)
 			}
 		default:
-			log.Fatalf("Could not get process group for child %d [%v]: %v",
+			logrus.Fatalf("Could not get process group for child %d [%v]: %v",
 				pid, reflect.TypeOf(err), err)
 		}
 	}
@@ -274,7 +274,7 @@ func devicePrefixForPath(device int32, p string) string {
 	// Trigger event to get its path.
 	err := os.Chtimes(p, time.Now(), time.Now())
 	if err != nil {
-		log.Fatalf("Failed set atime/mtime on %q: %v", p, err)
+		logrus.Fatalf("Failed set atime/mtime on %q: %v", p, err)
 	}
 
 	prefix := ""
@@ -288,7 +288,7 @@ func devicePrefixForPath(device int32, p string) string {
 		}
 	}
 
-	log.Debugf("got device path prefix %q for path %q", prefix, p)
+	logrus.Debugf("got device path prefix %q for path %q", prefix, p)
 
 	return prefix
 }
@@ -297,7 +297,7 @@ func watchPath(updateChan chan bool, p string) {
 	/// FIXME: aggregate paths per device?
 	device, err := fsevents.DeviceForPath(p)
 	if err != nil {
-		log.Fatalf("Failed to retrieve device for path %q: %v", p, err)
+		logrus.Fatalf("Failed to retrieve device for path %q: %v", p, err)
 	}
 
 	prefix := devicePrefixForPath(device, p) + "/"
@@ -319,7 +319,7 @@ func watchPath(updateChan chan bool, p string) {
 			}
 		}
 	}
-	log.Fatalf("Ran out of events for path %q", p)
+	logrus.Fatalf("Ran out of events for path %q", p)
 }
 
 var importantEventBits =
@@ -337,17 +337,17 @@ func shouldUpdate(prefix string, event fsevents.Event) bool {
 	if exclude != "" {
 		matched, err := doublestar.PathMatch(exclude, relativePath)
 		if err != nil {
-			log.Fatal(err)
+			logrus.Fatal(err)
 		}
 
 		if matched {
-			log.Debugf("Ignoring events on excluded path %s", relativePath)
+			logrus.Debugf("Ignoring events on excluded path %s", relativePath)
 			return false
 		}
 	}
 
 	if event.Flags&fsevents.ItemIsDir > 0 {
-		log.Debugf("Ignoring events on directory %s", relativePath)
+		logrus.Debugf("Ignoring events on directory %s", relativePath)
 		return false
 	}
 
@@ -392,5 +392,5 @@ func logEvent(prefix string, event fsevents.Event) {
 		}
 	}
 
-	log.Debugf("%s events: %s", strings.TrimPrefix(event.Path, prefix), note)
+	logrus.Debugf("%s events: %s", strings.TrimPrefix(event.Path, prefix), note)
 }

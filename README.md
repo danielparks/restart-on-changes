@@ -1,7 +1,7 @@
 # Restart a process when a path changes
 
 ```
-restart-on-changes go run main.go
+restart-on-changes -x .git go run main.go
 ```
 
 This restarts a process every time a file under a certain path is changed. It's

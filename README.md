@@ -23,7 +23,18 @@ Patterns to match files and directories to exclude.
 
 You may include this option multiple times to exclude multiple patterns. For example:
 
-    restart-on-changes -x .git -x '**/*.o' -x myapp sh -c 'make && build/myapp'
+    restart-on-changes -x .git -x '**/*.o' -x myapp 'make && build/myapp'
+
+### `--no-shell`
+
+By default the command is passed through `bash`. You can disable that by
+specifying `--no-shell`.
+
+    $ restart-on-changes echo first '&&' echo conditional
+    first
+    conditional
+    $ restart-on-changes --no-shell echo first '&&' echo conditional
+    first && echo conditional
 
 ### `-p PATH` and `--path PATH`
 

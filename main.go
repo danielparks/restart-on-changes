@@ -64,6 +64,9 @@ func processOptions() (command, paths, excludes []string) {
 	opt.Bool("debug", false, opt.Alias("d"))
 	opt.Bool("verbose", false, opt.Alias("v"))
 
+	// See comment below about how this is fucked up.
+	shellPtr := opt.NBool("shell", true, opt.Alias("s"))
+
 	pathsPtr := opt.StringSlice("path", 1, 1, opt.Alias("p"),
 		opt.Description("Paths to watch. Defaults to the current directory."))
 
@@ -93,6 +96,19 @@ func processOptions() (command, paths, excludes []string) {
 		logrus.SetLevel(logrus.WarnLevel)
 	}
 
+	// Fuck shit PC Load Letter. getopt interprets the default as the value for
+	// `--no-shell` in *addition* to being the default. `--no-shell` is always
+	// the default. The default is included in the `--help` output.
+	if opt.Called("shell") {
+		*shellPtr = !*shellPtr
+	} else {
+		*shellPtr = true
+	}
+
+	if *shellPtr {
+		command = shellConvert(command)
+	}
+
 	// Default to watching the current directory.
 	paths = *pathsPtr
 	if len(paths) == 0 {
@@ -119,6 +135,10 @@ func processOptions() (command, paths, excludes []string) {
 	logrus.Debugf("Excluding: %v", excludes)
 
 	return
+}
+
+func shellConvert(command []string) (shellCommand []string) {
+	return []string{"bash", "-c", strings.Join(command, " ")}
 }
 
 func runUntil(command []string, updateChan chan bool) {

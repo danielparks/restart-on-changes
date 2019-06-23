@@ -115,26 +115,30 @@ func processOptions() (command, paths, excludes []string) {
 		paths = []string{"."}
 	}
 
-	excludes = []string{}
-	for _, glob := range *excludesPtr {
-		excludes = append(excludes, glob)
-		_, err = doublestar.PathMatch(glob, ".")
+	excludes = processExcludeOption(*excludesPtr)
+	logrus.Debugf("Excluding: %v", excludes)
+
+	return
+}
+
+func processExcludeOption(patterns []string) (paths []string) {
+	for _, glob := range patterns {
+		paths = append(paths, glob)
+		_, err := doublestar.PathMatch(glob, ".")
 		if err != nil {
 			logrus.Fatalf("Invalid glob in exclude pattern %q", glob)
 		}
 
 		// When glob matches a directory we want to exclude its descendants too.
 		glob = path.Join(glob, "**")
-		excludes = append(excludes, glob)
+		paths = append(paths, glob)
 		_, err = doublestar.PathMatch(glob, ".")
 		if err != nil {
 			logrus.Fatalf("Invalid glob in exclude pattern %q", glob)
 		}
 	}
 
-	logrus.Debugf("Excluding: %v", excludes)
-
-	return
+	return paths
 }
 
 func shellConvert(command []string) (shellCommand []string) {

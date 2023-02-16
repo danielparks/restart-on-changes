@@ -1,4 +1,4 @@
-# Restart a process when a path changes
+# Restart a process when a path changes (no longer updated)
 
 ```
 restart-on-changes -x .git go run main.go
